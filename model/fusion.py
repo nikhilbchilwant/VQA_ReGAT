@@ -92,7 +92,7 @@ class BUTD(nn.Module):
         self.v_proj = FCNet([v_relation_dim, num_hid])
         self.q_proj = FCNet([q_dim, num_hid])
         self.dropout = nn.Dropout(dropout)
-        self.linear = FCNet([q_dim, 1])
+        self.linear = FCNet([num_hid, 1])
         self.q_net = FCNet([q_dim, num_hid])
         self.v_net = FCNet([v_relation_dim, num_hid])
 
