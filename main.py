@@ -17,7 +17,7 @@ from dataset import tfidf_from_questions
 from dataset_cp_v2 import VQA_cp_Dataset, Image_Feature_Loader
 from model.regat import build_regat
 from config.parser import parse_with_config
-from train import train
+from train import train_test
 import utils
 from utils import trim_collate
 
@@ -285,5 +285,5 @@ if __name__ == '__main__':
         json.dump(vars(args), writer, indent=4)
     logger = utils.Logger(join(args.output, 'log.txt'))
 
-    train(model, train_loader, eval_loader, args, device)
+    train_test(model, train_loader, eval_loader, test_loader, args, device)
 
