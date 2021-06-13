@@ -7,6 +7,8 @@ Linjie Li, Zhe Gan, Yu Cheng, Jingjing Liu
 https://arxiv.org/abs/1903.12314
 
 This code is written by Linjie Li.
+
+See https://github.com/linjieli222/VQA_ReGAT/issues/9
 """
 import numpy as np
 import math

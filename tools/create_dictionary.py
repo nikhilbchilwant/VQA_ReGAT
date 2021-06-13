@@ -53,8 +53,8 @@ if __name__ == '__main__':
     d = create_dictionary('data')
     d.dump_to_file('data/glove/dictionary.pkl')
 
-    d = Dictionary.load_from_file('data/dictionary.pkl')
+    d = Dictionary.load_from_file('data/glove/dictionary.pkl')
     emb_dim = 300
     glove_file = 'data/glove/glove.6B.%dd.txt' % emb_dim
     weights, word2emb = create_glove_embedding_init(d.idx2word, glove_file)
-    np.save('/data/glove/glove6b_init_%dd.npy' % emb_dim, weights)
+    np.save('data/glove/glove6b_init_%dd.npy' % emb_dim, weights)

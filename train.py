@@ -18,24 +18,31 @@ from tqdm import tqdm
 import utils
 from model.position_emb import prepare_graph_variables
 
+from sklearn.metrics import roc_auc_score
 
-def instance_bce_with_logits(logits, labels, reduction='mean'):
-    assert logits.dim() == 2
-    loss = F.binary_cross_entropy_with_logits(
-                                logits, labels, reduction=reduction)
-    if reduction == "mean":
-        loss *= labels.size(1)
-    return loss
+# def instance_bce_with_logits(logits, labels, reduction='mean'):
+#     assert logits.dim() == 2
+#     loss = F.binary_cross_entropy_with_logits(
+#                                 logits, labels, reduction=reduction)
+#     if reduction == "mean":
+#         loss *= labels.size(1)
+#     return loss
 
 
-def compute_score_with_logits(logits, labels, device):
-    # argmax
+# def compute_score_with_logits(logits, labels, device):
+#     # argmax
+#     logits = torch.max(logits, 1)[1].data
+#     logits = logits.view(-1, 1)
+#     one_hots = torch.zeros(*labels.size()).to(device)
+#     one_hots.scatter_(1, logits, 1)
+#     scores = (one_hots * labels)
+#     return scores
+
+def compute_auroc_with_logits(logits, target_labels, device):
     logits = torch.max(logits, 1)[1].data
-    logits = logits.view(-1, 1)
-    one_hots = torch.zeros(*labels.size()).to(device)
-    one_hots.scatter_(1, logits, 1)
-    scores = (one_hots * labels)
-    return scores
+    pred_labels = logits.cpu().numpy()
+    target_labels = target_labels.cpu().numpy()
+    return roc_auc_score(target_labels, pred_labels)
 
 
 def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
@@ -50,7 +57,9 @@ def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
     optim = torch.optim.Adamax(filter(lambda p: p.requires_grad,
                                       model.parameters()),
                                lr=lr_default, betas=(0.9, 0.999), eps=1e-8,
-                               weight_decay=args.weight_decay) 
+                               weight_decay=args.weight_decay)
+
+    criterion = torch.nn.CrossEntropyLoss()
 
     logger = utils.Logger(os.path.join(args.output, 'log.txt'))
     best_eval_score = 0
@@ -105,7 +114,8 @@ def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
                 args.sem_label_num, device)
             pred, att = model(v, norm_bb, q, pos_emb, sem_adj_matrix,
                               spa_adj_matrix, target)
-            loss = instance_bce_with_logits(pred, target)
+            # loss = instance_bce_with_logits(pred, target)
+            loss = criterion(pred, target)
 
             loss /= batch_multiplier
             loss.backward()
@@ -113,9 +123,9 @@ def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
             total_norm += nn.utils.clip_grad_norm_(model.parameters(),
                                                    args.grad_clip)
             count_norm += 1
-            batch_score = compute_score_with_logits(pred, target, device).sum()
+            batch_score = compute_auroc_with_logits(pred, target, device)
             total_loss += loss.data.item() * batch_multiplier * v.size(0)
-            train_score += batch_score
+            train_score += batch_score * batch_multiplier * v.size(0)
             pbar.update(1)
 
             if args.log_interval > 0:
@@ -136,17 +146,17 @@ def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
                     att_entropy = 0
 
         total_loss /= N
-        train_score = 100 * train_score / N
+        train_score = train_score / N
         if eval_loader is not None:
-            eval_score, bound, entropy = evaluate(
+            eval_score, entropy = evaluate(
                 model, eval_loader, device, args)
 
         logger.write('epoch %d, time: %.2f' % (epoch, time.time()-t))
-        logger.write('\ttrain_loss: %.2f, norm: %.4f, score: %.2f'
+        logger.write('\ttrain_loss: %.2f, norm: %.4f, AUROC: %.4f'
                      % (total_loss, total_norm / count_norm, train_score))
         if eval_loader is not None:
-            logger.write('\teval score: %.2f (%.2f)'
-                         % (100 * eval_score, 100 * bound))
+            logger.write('\tval AUROC: %.2f'
+                         % (100 * eval_score))
 
             if entropy is not None:
                 info = ''
@@ -158,7 +168,7 @@ def train(model, train_loader, eval_loader, args, device=torch.device("cuda")):
             logger.write("saving current model weights to folder")
             model_path = os.path.join(args.output, 'model_%d.pth' % epoch)
             opt = optim if args.save_optim else None
-            utils.save_model(model_path, model, epoch, opt)
+            # utils.save_model(model_path, model, epoch, opt)
 
 
 @torch.no_grad()
@@ -166,7 +176,6 @@ def evaluate(model, dataloader, device, args):
     model.eval()
     relation_type = dataloader.dataset.relation_type
     score = 0
-    upper_bound = 0
     num_data = 0
     N = len(dataloader.dataset)
     entropy = None
@@ -189,10 +198,9 @@ def evaluate(model, dataloader, device, args):
             args.sem_label_num, device)
         pred, att = model(v, norm_bb, q, pos_emb, sem_adj_matrix,
                           spa_adj_matrix, target)
-        batch_score = compute_score_with_logits(
-                        pred, target, device).sum()
+        batch_score = compute_auroc_with_logits(
+                        pred, target, device) * batch_size
         score += batch_score
-        upper_bound += (target.max(1)[0]).sum()
         num_data += pred.size(0)
         if att is not None and 0 < model.module.glimpse\
                 and entropy is not None:
@@ -200,12 +208,11 @@ def evaluate(model, dataloader, device, args):
         pbar.update(1)
 
     score = score / len(dataloader.dataset)
-    upper_bound = upper_bound / len(dataloader.dataset)
 
     if entropy is not None:
         entropy = entropy / len(dataloader.dataset)
     model.train()
-    return score, upper_bound, entropy
+    return score, entropy
 
 
 def calc_entropy(att):

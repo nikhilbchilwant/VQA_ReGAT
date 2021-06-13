@@ -18,6 +18,9 @@ from torch.utils.data import Dataset
 import tools.compute_softscore
 import itertools
 import math
+import jsonlines
+import collections
+
 
 # TODO: merge dataset_cp_v2.py with dataset.py
 
@@ -113,7 +116,7 @@ def _create_entry(img, question, answer):
     return entry
 
 
-def _load_dataset(dataroot, name, img_id2val, label2ans):
+def _load_dataset(dataroot, name, img_id2val, label2ans=None):
     """Load entries
 
     img_id2val: dict {img_id -> val} val can be used to
@@ -121,6 +124,9 @@ def _load_dataset(dataroot, name, img_id2val, label2ans):
     dataroot: root path of dataset
     name: 'train', 'val', 'test-dev2015', test2015'
     """
+    # import pdb;
+    # pdb.set_trace()
+
     question_path = os.path.join(
         dataroot, 'Questions/v2_OpenEnded_mscoco_%s_questions.json' %
         (name + '2014' if 'test' != name[:4] else name))
@@ -151,6 +157,40 @@ def _load_dataset(dataroot, name, img_id2val, label2ans):
                or is_howmany(question['question'], None, None):
                 entries.append(_create_entry(img_id2val[img_id],
                                              question, None))
+
+    return entries
+
+def _load_annotations(dataroot, name, img_id2val):
+    """Load entries
+
+    img_id2val: dict {img_id -> val} val can be used to
+                retrieve image or features
+    dataroot: root path of dataset
+    name: 'train', 'val', 'test'
+    """
+    annotation_path = os.path.join(
+        dataroot, 'annotations/%s.jsonl' % (name))
+
+    question_list = []
+    answer_list = []
+    with jsonlines.open(annotation_path) as reader:
+        for annotation in reader:
+            question_list.append({'image_id' : annotation['id'], 'question':
+                annotation['text'], 'question_id': annotation['id']})
+            answer_list.append(
+                {'image_id' : annotation['id'], 'question_id': annotation['id'],
+                 'labels': [annotation['label']]})
+
+    questions = sorted(question_list, key=lambda x: x['image_id'])
+    answers = sorted(answer_list, key=lambda x: x['question_id'])
+
+    utils.assert_eq(len(questions), len(answers))
+    entries = []
+
+    for question, answer in zip(questions, answers):
+        utils.assert_eq(question['question_id'], answer['question_id'])
+        img_id = int(question['image_id'])
+        entries.append(_create_entry(img_id2val[img_id], question, answer))
 
     return entries
 
@@ -513,6 +553,173 @@ class VisualGenomeFeatureDataset(Dataset):
     def __len__(self):
         return len(self.entries)
 
+#Create HDF5 files using https://github.com/jnhwkim/ban-vqa/blob/bcb6e28cf80046f615eb1bd53656c2cb09db31e6/tools/adaptive_detection_features_converter.py
+class HMFeatureDataset(Dataset):
+    def __init__(self, name, dictionary, relation_type, dataroot='data',
+                 adaptive=False, pos_emb_dim=64, nongt_dim=36):
+        super(HMFeatureDataset, self).__init__()
+        assert name in ['train', 'val', 'test']
+
+        # ans2label_path = os.path.join(dataroot, 'cache',
+        #                               'trainval_ans2label.pkl')
+        # label2ans_path = os.path.join(dataroot, 'cache',
+        #                               'trainval_label2ans.pkl')
+        # self.ans2label = pickle.load(open(ans2label_path, 'rb'))
+        # self.label2ans = pickle.load(open(label2ans_path, 'rb'))
+        self.num_ans_candidates = 2 #hateful/non-hateful #len(self.ans2label)
+        self.dictionary = dictionary
+        self.relation_type = relation_type
+        self.adaptive = adaptive
+        prefix = '50'
+        if 'test' in name:
+            prefix = '_50'
+
+        h5_dataroot = dataroot+"/Bottom-up-features-adaptive"\
+            if self.adaptive else dataroot+"/Bottom-up-features-fixed"
+        imgid_dataroot = dataroot+"/imgids"
+
+        self.img_id2idx = pickle.load(
+            open(os.path.join(imgid_dataroot, '%s%s_imgid2idx.pkl' %
+                              (name, '' if self.adaptive else prefix)), 'rb'))
+
+        h5_path = os.path.join(h5_dataroot, '%s%s.hdf5' %
+                               (name, '' if self.adaptive else prefix))
+
+        print('loading features from h5 file %s' % h5_path)
+        with h5py.File(h5_path, 'r') as hf:
+            self.features = np.array(hf.get('image_features'))
+            self.normalized_bb = np.array(hf.get('spatial_features'))
+            self.bb = np.array(hf.get('image_bb'))
+            if "semantic_adj_matrix" in hf.keys() \
+               and self.relation_type == "semantic":
+                self.semantic_adj_matrix = np.array(
+                                        hf.get('semantic_adj_matrix'))
+                print("Loaded semantic adj matrix from file...",
+                      self.semantic_adj_matrix.shape)
+            else:
+                self.semantic_adj_matrix = None
+                print("Setting semantic adj matrix to None...")
+            if "image_adj_matrix" in hf.keys()\
+               and self.relation_type == "spatial":
+                self.spatial_adj_matrix = np.array(hf.get('image_adj_matrix'))
+                print("Loaded spatial adj matrix from file...",
+                      self.spatial_adj_matrix.shape)
+            else:
+                self.spatial_adj_matrix = None
+                print("Setting spatial adj matrix to None...")
+
+            self.pos_boxes = None
+            if self.adaptive:
+                self.pos_boxes = np.array(hf.get('pos_boxes'))
+
+        self.entries = _load_annotations(dataroot, name, self.img_id2idx)
+        self.tokenize()
+        self.tensorize()
+        self.nongt_dim = nongt_dim
+        self.emb_dim = pos_emb_dim
+        self.v_dim = self.features.size(1 if self.adaptive else 2)
+        self.s_dim = self.normalized_bb.size(1 if self.adaptive else 2)
+
+    def tokenize(self, max_length=14):
+        """Tokenizes the texts.
+
+        This will add q_token in each entry of the dataset.
+        -1 represent nil, and should be treated as padding_idx in embedding
+        """
+        for entry in self.entries:
+            tokens = self.dictionary.tokenize(entry['question'], False)
+            tokens = tokens[:max_length]
+            if len(tokens) < max_length:
+                # Note here we pad to the back of the sentence
+                padding = [self.dictionary.padding_idx] * \
+                          (max_length - len(tokens))
+                tokens = tokens + padding
+            utils.assert_eq(len(tokens), max_length)
+            entry['q_token'] = tokens
+
+    def tensorize(self):
+        self.features = torch.from_numpy(self.features)
+        self.normalized_bb = torch.from_numpy(self.normalized_bb)
+        self.bb = torch.from_numpy(self.bb)
+        if self.semantic_adj_matrix is not None:
+            self.semantic_adj_matrix = torch.from_numpy(
+                                        self.semantic_adj_matrix).double()
+        if self.spatial_adj_matrix is not None:
+            self.spatial_adj_matrix = torch.from_numpy(
+                                        self.spatial_adj_matrix).double()
+        if self.pos_boxes is not None:
+            self.pos_boxes = torch.from_numpy(self.pos_boxes)
+
+        for entry in self.entries:
+            question = torch.from_numpy(np.array(entry['q_token']))
+            entry['q_token'] = question
+
+            answer = entry['answer']
+            if answer is not None:
+                labels = np.array(answer['labels'])
+                # scores = np.array(answer['scores'], dtype=np.float32)
+                if len(labels):
+                    label = torch.from_numpy(labels)
+                    # scores = torch.from_numpy(scores)
+                    entry['answer']['labels'] = labels
+                    # entry['answer']['scores'] = scores
+                else:
+                    # entry['answer']['labels'] = None
+                    # entry['answer']['scores'] = None
+                    raise ValueError
+
+    def __getitem__(self, index):
+        entry = self.entries[index]
+        raw_question = entry["question"]
+        image_id = entry["image_id"]
+
+        question = entry['q_token']
+        question_id = entry['question_id']
+        if self.spatial_adj_matrix is not None:
+            spatial_adj_matrix = self.spatial_adj_matrix[entry["image"]]
+        else:
+            spatial_adj_matrix = torch.zeros(1).double()
+        if self.semantic_adj_matrix is not None:
+            semantic_adj_matrix = self.semantic_adj_matrix[entry["image"]]
+        else:
+            semantic_adj_matrix = torch.zeros(1).double()
+        if not self.adaptive:
+            # fixed number of bounding boxes
+            features = self.features[entry['image']]
+            normalized_bb = self.normalized_bb[entry['image']]
+            bb = self.bb[entry["image"]]
+        else:
+            features = self.features[
+                self.pos_boxes[
+                    entry['image']][0]:self.pos_boxes[entry['image']][1], :]
+            normalized_bb = self.normalized_bb[
+                self.pos_boxes[
+                    entry['image']][0]:self.pos_boxes[entry['image']][1], :]
+            bb = self.bb[
+                self.pos_boxes[
+                    entry['image']][0]:self.pos_boxes[entry['image']][1], :]
+
+        answer = entry['answer']
+        if answer is not None:
+            label = answer['labels'][0]
+            # scores = answer['scores']
+            # target = torch.zeros(self.num_ans_candidates)
+            # if labels is not None:
+            #     target.scatter_(0, labels, None)
+            target = torch.tensor(label, dtype=torch.int64)
+            return features, normalized_bb, question, target,\
+                question_id, image_id, bb, spatial_adj_matrix,\
+                semantic_adj_matrix
+
+        else:
+            # return features, normalized_bb, question, question_id,\
+            #     question_id, image_id, bb, spatial_adj_matrix,\
+            #     semantic_adj_matrix
+            raise ValueError
+
+    def __len__(self):
+        return len(self.entries)
+
 
 def tfidf_from_questions(names, dictionary, dataroot='data',
                          target=['vqa', 'vg']):
@@ -546,6 +753,19 @@ def tfidf_from_questions(names, dictionary, dataroot='data',
             for question in questions:
                 populate(inds, df, question['question'])
 
+    if 'hm' in target:
+        for name in names:
+            assert name in ['train', 'val', 'test']
+            question_path = os.path.join(dataroot, 'annotations/%s.jsonl' % (name))
+
+            questions = []
+            with jsonlines.open(question_path) as reader:
+                for annotation in reader:
+                    questions.append({'question': annotation['text']})
+
+            for question in questions:
+                populate(inds, df, question['question'])
+
     # Visual Genome
     if 'vg' in target:
         question_path = os.path.join(dataroot, 'visualGenome',
@@ -574,6 +794,7 @@ def tfidf_from_questions(names, dictionary, dataroot='data',
 
     tfidf = torch.sparse.FloatTensor(torch.LongTensor(inds),
                                      torch.FloatTensor(vals))
+
     tfidf = tfidf.coalesce()
 
     # Latent word embeddings
@@ -587,6 +808,7 @@ def tfidf_from_questions(names, dictionary, dataroot='data',
     return tfidf, weights
 
 
+
 # VisualGenome Train
 #     Used COCO images: 51487/108077 (0.4764)
 #     Out-of-split COCO images: 17464/51487 (0.3392)
@@ -596,3 +818,5 @@ def tfidf_from_questions(names, dictionary, dataroot='data',
 #     Used COCO images: 51487/108077 (0.4764)
 #     Out-of-split COCO images: 34023/51487 (0.6608)
 #     Used VG questions: 166409/726932 (0.2289)
+
+

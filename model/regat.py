@@ -105,7 +105,7 @@ def build_regat(dataset, args):
                         residual_connection=args.residual_connection,
                         label_bias=args.label_bias)
 
-    classifier = SimpleClassifier(args.num_hid, args.num_hid * 2,
+    classifier = SimpleClassifier(args.num_hid, args.num_hid // 2,
                                   dataset.num_ans_candidates, 0.5)
     gamma = 0
     if args.fusion == "ban":

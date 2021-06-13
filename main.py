@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, ConcatDataset, random_split
 import random
 import json
 
-from dataset import Dictionary, VQAFeatureDataset, VisualGenomeFeatureDataset
+from dataset import Dictionary, VQAFeatureDataset, VisualGenomeFeatureDataset, HMFeatureDataset
 from dataset import tfidf_from_questions
 from dataset_cp_v2 import VQA_cp_Dataset, Image_Feature_Loader
 from model.regat import build_regat
@@ -54,7 +54,7 @@ def parse_args():
     For dataset
     '''
     parser.add_argument('--dataset', type=str, default='vqa',
-                        choices=["vqa", "vqa_cp"])
+                        choices=["vqa", "vqa_cp", "hm"])
     parser.add_argument('--data_folder', type=str, default='./data')
     parser.add_argument('--use_both', action='store_true',
                         help='use both train/val datasets to train?')
@@ -117,6 +117,8 @@ def parse_args():
     args = parse_with_config(parser)
     return args
 
+def get_reduced_data(data_series, data_reduction_fac=10):
+    return data_series[0:(int)(len(data_series) / data_reduction_fac)]
 
 if __name__ == '__main__':
     args = parse_args()
@@ -162,12 +164,25 @@ if __name__ == '__main__':
                     coco_val_features, adaptive=args.adaptive,
                     pos_emb_dim=args.imp_pos_emb_dim,
                     dataroot=args.data_folder)
-    else:
+    elif args.dataset == "vqa":
         val_dset = VQAFeatureDataset(
                 'val', dictionary, args.relation_type, adaptive=args.adaptive,
                 pos_emb_dim=args.imp_pos_emb_dim, dataroot=args.data_folder)
-        train_dset = VQAFeatureDataset(
+        # train_dset = VQAFeatureDataset(
+        #         'train', dictionary, args.relation_type,
+        #         adaptive=args.adaptive, pos_emb_dim=args.imp_pos_emb_dim,
+        #         dataroot=args.data_folder)
+
+    else:
+        val_dset = HMFeatureDataset(
+                'val', dictionary, args.relation_type, adaptive=args.adaptive,
+                pos_emb_dim=args.imp_pos_emb_dim, dataroot=args.data_folder)
+        train_dset = HMFeatureDataset(
                 'train', dictionary, args.relation_type,
+                adaptive=args.adaptive, pos_emb_dim=args.imp_pos_emb_dim,
+                dataroot=args.data_folder)
+        test_dset = HMFeatureDataset(
+                'test', dictionary, args.relation_type,
                 adaptive=args.adaptive, pos_emb_dim=args.imp_pos_emb_dim,
                 dataroot=args.data_folder)
 
@@ -176,8 +191,10 @@ if __name__ == '__main__':
     tfidf = None
     weights = None
     if args.tfidf:
-        tfidf, weights = tfidf_from_questions(['train', 'val', 'test2015'],
-                                              dictionary)
+        tfidf, weights = tfidf_from_questions(['train', 'val', 'test'],
+                                              dictionary, dataroot='data/hm_vg10100',
+                                              target=['hm'])
+
     model.w_emb.init_embedding(join(args.data_folder,
                                     'glove/glove6b_init_300d.npy'),
                                tfidf, weights)
@@ -252,6 +269,8 @@ if __name__ == '__main__':
                                   num_workers=4, collate_fn=trim_collate)
         eval_loader = DataLoader(val_dset, batch_size, shuffle=False,
                                  num_workers=4, collate_fn=trim_collate)
+        test_loader = DataLoader(test_dset, batch_size, shuffle=False,
+                                 num_workers=4, collate_fn=trim_collate)
 
     output_meta_folder = join(args.output, "regat_%s" % args.relation_type)
     utils.create_dir(output_meta_folder)
@@ -267,3 +286,4 @@ if __name__ == '__main__':
     logger = utils.Logger(join(args.output, 'log.txt'))
 
     train(model, train_loader, eval_loader, args, device)
+
